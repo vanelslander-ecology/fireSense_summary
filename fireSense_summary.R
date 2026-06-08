@@ -9,50 +9,53 @@ defineModule(sim, list(
     person("Ian MS", "Eddy", email = "ian.eddy@nrcan-rncan.gc.ca", role = "aut")
   ),
   childModules = character(0),
-  version = list(fireSense_summary = "0.0.0.9000"),
+  version = list(fireSense_summary = "1.0.1"),
   timeframe = as.POSIXlt(c(NA, NA)),
   timeunit = "year",
   citation = list("citation.bib"),
   documentation = list("README.md", "fireSense_summary.Rmd"), ## same file
-  reqdPkgs = list("assertthat", "cowplot", "data.table", "disk.frame", "fs",
-                  "PredictiveEcology/fireSenseUtils@dev-stable (>= 0.0.5.9048)",
-                  "ggplot2", "googledrive", "purrr", "raster", "rasterVis", "RColorBrewer",
-                  "SpaDES.core (>= 1.0.10)", "SpaDES.tools", "qs"),
+  loadOrder = list(after = c("fireSense")),
+  reqdPkgs = list(
+    "assertthat", "cowplot", "data.table", "fs", "ggplot2", "googledrive",
+    "purrr", "qs2", "RColorBrewer", "terra", "tidyterra",
+    "raster", "rasterVis", ## TODO: remove these once fireSenseUtils::plotCumulativeBurns switched to ggplot2/tidyterra
+    "PredictiveEcology/fireSenseUtils@development (>= 0.1.2.9000)",
+    "PredictiveEcology/SpaDES.core@development (>= 3.0.3.9003)",
+    "PredictiveEcology/SpaDES.tools@development (>= 2.1.1.9000)"
+  ),
   parameters = rbind(
     #defineParameter("paramName", "paramClass", value, min, max, "parameter description"),
-    defineParameter("climateScenarios", "character", NA, NA, NA,
-                    desc = paste("names of CIMP6 climate scenarios including SSP,",
-                                 "formatted as in ClimateNA, using underscores as separator.",
+    defineParameter("climateScenario", "character", NA, NA, NA,
+                    desc = paste("name of CIMP6 climate scenarios including SSP,",
+                                 "formatted as in `ClimateNA`, using underscores as separator.",
                                  "E.g., 'CanESM5_SSP370'.")),
+    defineParameter("mode", "character", "single", NA, NA,
+                    paste("use 'single' to run part of a simulation;",
+                          "use 'multi' to run as part of postprocessing multiple runs.")),
     defineParameter("simOutputPath", "character", outputPath(sim), NA, NA,
                     desc = "Directory specifying the location of the simulation outputs."),
-    defineParameter("studyAreaNames", "character", NA, NA, NA,
-                    desc = "names of study areas simulated."),
-    defineParameter("reps", "integer", 1:10, 1, NA,
+    defineParameter("studyAreaName", "character", NA, NA, NA,
+                    desc = "name of study areas simulated."),
+    defineParameter("reps", "integer", 1L:10L, 1, NA,
                     desc = paste("number of replicates/runs per study area and climate scenario.",
                                  "NOTE: `mclapply` is used internally, so you should set",
                                  "`options(mc.cores = nReps)` to run in parallel.")),
-    defineParameter("upload", "logical", FALSE, NA, NA,
-                    desc = "if TRUE, uses the `googledrive` package to upload figures."),
-    defineParameter("years", "integer", c(2011, 2100), NA, NA,
-                    desc = "Which two simulation years should be compared? Typically start and end years.")
+    defineParameter("years", "integer", c(2011L, 2100L), NA, NA,
+                    desc = paste("Which two simulation years should be compared?",
+                                 "Typically start and end years."))
   ),
   inputObjects = bindrows(
-    #expectsInput("objectName", "objectClass", "input object description", sourceURL, ...),
-    expectsInput("burnMap", "RasterLayer",
-                 "loaded from disk (i.e., from files in `simOutputPath`).",
+    expectsInput("burnMap", "SpatRaster",
+                 desc = paste("Cumulative burn map.", "Required in single mode."),
                  sourceURL = NA),
     expectsInput("burnSummary", "data.table",
-                 "loaded from disk (i.e., from files in `simOutputPath`).",
+                 paste("Fire summary table from `fireSense`.", "Required in single mode."),
                  sourceURL = NA),
-    expectsInput("rasterToMatch", "RasterLayer", "DESCRIPTION NEEDED", sourceURL = NA),
-    expectsInput("uploadTo", "character",
-                 desc = paste("if `upload = TRUE`, a named list of Google Drive folder ids,",
-                              "corresponding to `studyAreaNames`."),
+    expectsInput("rasterToMatch", "SpatRaster",
+                 paste("template raster used by the simulations for summary reporting"),
                  sourceURL = NA)
   ),
   outputObjects = bindrows(
-    #createsOutput("objectName", "objectClass", "output object description", ...),
     createsOutput(objectName = NA, objectClass = NA, desc = NA)
   )
 ))
@@ -64,130 +67,168 @@ doEvent.fireSense_summary = function(sim, eventTime, eventType) {
   switch(
     eventType,
     init = {
-      ### check for more detailed object dependencies:
-      ### (use `checkObject` or similar)
+      if (P(sim)$mode == "single") {
+        sim <- scheduleEvent(sim, end(sim), "fireSense_summary", "save_single", .last())
+      } else if (P(sim)$mode == "multi") {
+        sim <- InitMulti(sim)
 
-      # do stuff for this event
-      sim <- Init(sim)
+        padYear <- paddedFloatToChar(time(sim), padL = ceiling(log10(end(sim) + 1)))
 
-      # schedule future event(s)
-      sim <- scheduleEvent(sim, start(sim), "fireSense_summary", "plot_burnSummary")
-      sim <- scheduleEvent(sim, start(sim), "fireSense_summary", "plot_cumulBurn")
-      sim <- scheduleEvent(sim, start(sim), "fireSense_summary", "plot_historic")
+        f_burnSummary_plot <- fireSenseUtils::plotBurnSummary(
+          climateScenario = P(sim)$climateScenario,
+          studyAreaName = P(sim)$studyAreaName,
+          outputDir = P(sim)$simOutputPath,
+          Nreps = max(P(sim)$reps),
+          years = P(sim)$years,
+          pixelSize = unique(terra::res(sim$rasterToMatch))
+        )
+        sim <- registerOutputs(f_burnSummary_plot, sim)
 
-      if (isTRUE(P(sim)$upload)) {
-        sim <- scheduleEvent(sim, end(sim), "fireSense_summary", "upload", .last())
+        f_cumulBurn_plot <- fireSenseUtils::plotCumulativeBurns(
+          climateScenario = P(sim)$climateScenario,
+          studyAreaName = P(sim)$studyAreaName,
+          outputDir = P(sim)$simOutputPath,
+          Nreps = max(P(sim)$reps),
+          years = P(sim)$years,
+          rasterToMatch = sim$rasterToMatch
+        )
+        sim <- registerOutputs(f_cumulBurn_plot, sim)
+
+        f_historic_plot <- fireSenseUtils::plotHistoricFires(
+          climateScenario = P(sim)$climateScenario,
+          studyAreaName = P(sim)$studyAreaName,
+          outputDir = P(sim)$simOutputPath,
+          pixelSize = unique(terra::res(sim$rasterToMatch)),
+          firePolys = mod$firePolys,
+          ignitionPoints = mod$ignitionFirePoints
+        )
+        sim <- registerOutputs(f_historic_plot, sim)
       }
     },
-    plot_burnSummary = {
-      # ! ----- EDIT BELOW ----- ! #
+    save_single = {
+      padYear <- paddedFloatToChar(time(sim), padL = ceiling(log10(end(sim) + 1)))
 
-      files2upload <- lapply(P(sim)$studyAreaNames, function(studyAreaName) {
-        lapply(P(sim)$climateScenarios, function(climateScenario) {
-          plotBurnSummary(
-            studyAreaName = studyAreaName,
-            climateScenario = climateScenario,
-            outputDir = P(sim)$simOutputPath,
-            Nreps = max(P(sim)$reps)
-          )
-        })
-      })
-      files2upload <- unlist(files2upload, recursive = TRUE)
+      f_burnMap <- file.path(outputPath(sim), paste0("burnMap_year", padYear, ".tif"))
+      terra::writeRaster(sim$burnMap, f_burnMap, datatype = "INT2U", overwrite = TRUE)
+      sim <- registerOutputs(f_burnMap, sim)
 
-      mod$files2upload <- c(mod$files2upload, files2upload)
-
-      # ! ----- STOP EDITING ----- ! #
+      f_burnSummary <- file.path(outputPath(sim), "fireSense_burnSummary.csv")
+      data.table::fwrite(sim$burnSummary, file = f_burnSummary)
+      sim <- registerOutputs(f_burnSummary, sim)
     },
-    plot_cumulBurn = {
-      # ! ----- EDIT BELOW ----- ! #
-
-      files2upload <- lapply(P(sim)$studyAreaNames, function(studyAreaName) {
-        ## get rasterToMatch for each studyArea
-        tmp <- loadSimList(file.path(P(sim)$simOutputPath, studyAreaName,
-                                     paste0("simOutPreamble_", studyAreaName, "_",
-                                            gsub("SSP", "", P(sim)$climateScenarios[1]), ".qs")))
-        sim$rasterToMatch <- tmp$rasterToMatchReporting
-        rm(tmp)
-
-        lapply(P(sim)$climateScenarios, function(climateScenario) {
-          plotCumulativeBurns(
-            studyAreaName = studyAreaName,
-            climateScenario = climateScenario,
-            outputDir = P(sim)$simOutputPath,
-            Nreps = max(P(sim)$reps),
-            rasterToMatch = sim$rasterToMatch
-          )
-        })
-      })
-      files2upload <- unlist(files2upload, recursive = TRUE)
-
-      mod$files2upload <- c(mod$files2upload, files2upload)
-
-      # ! ----- STOP EDITING ----- ! #
-    },
-    plot_historic = {
-      # ! ----- EDIT BELOW ----- ! #
-
-      files2upload <- lapply(P(sim)$studyAreaNames, function(studyAreaName) {
-        lapply(P(sim)$climateScenarios, function(climateScenario) {
-          plotHistoricFires(
-            climateScenario = climateScenario,
-            studyAreaName = studyAreaName,
-            outputDir = P(sim)$simOutputPath,
-            firePolys = mod$firePolys,
-            ignitionPoints = mod$ignitionFirePoints
-          )
-        })
-      })
-      files2upload <- unlist(files2upload, recursive = TRUE)
-
-      mod$files2upload <- c(mod$files2upload, files2upload)
-
-      # ! ----- STOP EDITING ----- ! #
-    },
-    upload = {
-      # ! ----- EDIT BELOW ----- ! #
-      mod$files2upload <- set_names(mod$files2upload, basename(mod$files2upload))
-
-      gid <- as_id(sim$uploadTo[[P(sim)$studyAreaName]])
-      prevUploaded <- drive_ls(gid)
-      toUpload <- mod$files2upload[!(basename(mod$files2upload) %in% prevUploaded$name)]
-      uploaded <- map(toUpload, ~ drive_upload(.x, path = gid))
-      # ! ----- STOP EDITING ----- ! #
-    },
-    warning(paste("Undefined event type: \'", current(sim)[1, "eventType", with = FALSE],
-                  "\' in module \'", current(sim)[1, "moduleName", with = FALSE], "\'", sep = ""))
+    noEventWarning(sim)
   )
   return(invisible(sim))
 }
 
-## event functions
-#   - keep event functions short and clean, modularize by calling subroutines from section below.
-
-### template initialization
-Init <- function(sim) {
+InitMulti <- function(sim) {
   # # ! ----- EDIT BELOW ----- ! #
 
-  checkPath(file.path(P(sim)$simOutputPath, P(sim)$studyAreaNames, "figures"), create = TRUE)
+  ## check for necessary output files -----------------------------------------------
+  allReps <- sprintf("rep%02d", P(sim)$reps)
+  padL <- ceiling(log10(P(sim)$years[2] + 1))
+  padYearStart <- paddedFloatToChar(P(sim)$years[1], padL = padL)
+  padYearEnd <- paddedFloatToChar(P(sim)$years[2], padL = padL)
 
-  ## TODO: inventory all files to ensure correct dir structure? compare against expected files?
-  #filesUserHas <- fs::dir_ls(P(sim)$simOutputPath, recurse = TRUE, type = "file", glob = "*.qs")
+  checkPath(file.path(P(sim)$simOutputPath, "figures", currentModule(sim)), create = TRUE)
 
-  filesUserExpects <- rbindlist(lapply(P(sim)$studyAreaNames, function(studyAreaName) {
-    rbindlist(lapply(P(sim)$climateScenarios, function(climateScenario) {
-      rbindlist(lapply(P(sim)$reps, function(rep) {
-        runName <- sprintf("%s_%s", studyAreaName, climateScenario)
-        f <- file.path(P(sim)$simOutputPath, runName, sprintf("rep%02d", as.integer(rep)),
-                       paste0(runName, "_", sprintf("rep%02d", as.integer(rep)), ".qs"))
+  bmbs <- fs::dir_ls(
+    P(sim)$simOutputPath,
+    regexp = "burnMap|burnSummary",
+    recurse = 1,
+    type = "file"
+  ) |>
+    grep(paste0("(", paste0(P(sim)$reps, collapse = "|"), ")"), x = _, value = TRUE) |>
+    grep(paste0("_year(", paste0(P(sim)$years, collapse = "|"), ")"), x = _, value = TRUE)
 
-        data.table(file = f, exists = file.exists(f))
-      }))
-    }))
+  filesUserHas <- c(bmbs)
+
+  dirsExpected <- file.path(P(sim)$simOutputPath, allReps)
+  filesExpected <- as.character(sapply(dirsExpected, function(d) {
+    c(
+      file.path(d, sprintf("burnMap_year%04d.tif", P(sim)$years[2])),
+      file.path(d, "fireSense_burnSummary.csv")
+    )
   }))
 
-  if (!all(filesUserExpects$exists)) {
-    missing <- filesUserExpects[exists == FALSE, ]$file
-    stop("Some simulation files missing:\n", paste(missing, collapse = "\n"))
+  filesNeeded <- data.frame(file = filesExpected, exists = filesExpected %in% filesUserHas)
+
+  if (!all(filesNeeded$exists)) {
+    missing <- filesNeeded[filesNeeded$exists == FALSE, ]$file
+    stop(
+      sum(!filesNeeded$exists),
+      " simulation files appear to be missing:\n",
+      paste(missing, collapse = "\n")
+    )
+  }
+
+  ## get historical fire points and polys -------------------------------------------
+
+  ## TODO: use an updated/working prepInputs version (fireSenseUtils::getFirePolygons?)
+  mod$firePolys <- {
+    dst <- inputPath(sim)
+    nfdb_url <- "https://cwfis.cfs.nrcan.gc.ca/downloads/nfdb/fire_poly/current_version/NFDB_poly.zip"
+    nfdb_zip <- file.path(dst, basename(nfdb_url))
+
+    if (!file.exists(nfdb_zip)) {
+      download.file(nfdb_url, destfile = nfdb_zip)
+    }
+
+    all_nfdb_files <- fs::dir_ls(dst, regexp = "NFDB_poly_(1972to2020|2021to2024).*")
+
+    if (length(all_nfdb_files) != 16) {
+      archive::archive_extract(nfdb_zip, dst)
+    }
+
+    nfdb_shp <- fs::dir_ls(dst, regexp = "NFDB_poly_(1972to2020|2021to2024).*[.]shp$")
+
+    purrr::map(.x = nfdb_shp, .f = function(x) {
+      p <- terra::vect(x)
+
+      ## NOTE: terra::makeValid takes so long;
+      ## just drop the tiny number of invalid geometries
+      p[terra::is.valid(p), ]
+    }) |>
+      tidyterra::bind_spat_rows() |>
+      tidyterra::mutate(
+        YEAR = as.integer(YEAR),
+        MONTH = as.integer(MONTH),
+        DAY = as.integer(DAY)
+      ) |>
+      terra::project(sim$rasterToMatch)
+  }
+
+  ## TODO: use an updated/working prepInputs version (fireSenseUtils::getFirePoints_NFDB_V2?)
+  mod$ignitionFirePoints <- {
+    dst <- inputPath(sim)
+
+    nfdb_url <- "http://cwfis.cfs.nrcan.gc.ca/downloads/nfdb/fire_pnt/current_version/NFDB_point.zip"
+    nfdb_zip <- file.path(dst, basename(nfdb_url))
+
+    if (!file.exists(nfdb_zip)) {
+      download.file(nfdb_url, destfile = nfdb_zip)
+    }
+
+    all_nfdb_files <- fs::dir_ls(dst, regexp = "NFDB_point_.*")
+
+    if (length(all_nfdb_files) != 10) {
+      archive::archive_extract(nfdb_zip, dst)
+    }
+
+    nfdb_shp <- fs::dir_ls(dst, regexp = "NFDB_point_.*[.]shp$")
+
+    ## NOTE: using terra here because it's much faster than sf
+    p <- terra::vect(nfdb_shp)
+
+    ## NOTE: terra::makeValid takes so long;
+    ## just drop the tiny number of invalid geometries
+    p[terra::is.valid(p), ] |>
+      tidyterra::mutate(
+        YEAR = as.integer(YEAR),
+        MONTH = as.integer(MONTH),
+        DAY = as.integer(DAY)
+      ) |>
+      terra::project(sim$rasterToMatch)
   }
 
   # ! ----- STOP EDITING ----- ! #
@@ -196,32 +237,9 @@ Init <- function(sim) {
 }
 
 .inputObjects <- function(sim) {
-  # Any code written here will be run during the simInit for the purpose of creating
-  # any objects required by this module and identified in the inputObjects element of defineModule.
-  # This is useful if there is something required before simulation to produce the module
-  # object dependencies, including such things as downloading default datasets, e.g.,
-  # downloadData("LCC2005", modulePath(sim)).
-  # Nothing should be created here that does not create a named object in inputObjects.
-  # Any other initiation procedures should be put in "init" eventType of the doEvent function.
-  # Note: the module developer can check if an object is 'suppliedElsewhere' to
-  # selectively skip unnecessary steps because the user has provided those inputObjects in the
-  # simInit call, or another module will supply or has supplied it. e.g.,
-  # if (!suppliedElsewhere('defaultColor', sim)) {
-  #   sim$map <- Cache(prepInputs, extractURL('map')) # download, extract, load file from url in sourceURL
-  # }
-
-  #cacheTags <- c(currentModule(sim), "function:.inputObjects") ## uncomment this if Cache is being used
-  dPath <- asPath(inputPath(sim), 1)
-  message(currentModule(sim), ": using dataPath '", dPath, "'.")
-
   # ! ----- EDIT BELOW ----- ! #
 
-  ## same historic fire polygons for all sims, so it doesn't matter which one we load
-  sim_fsDP <- loadSimList(file.path("outputs", P(sim)$studyAreaNames[[1]],
-                                    paste0("fSsimDataPrep_", P(sim)$studyAreaNames[[1]], ".qs")))
-  mod$firePolys <- sim_fsDP$firePolys
-  mod$ignitionFirePoints <- sim_fsDP$ignitionFirePoints
-  rm(sim_fsDP)
+  ## nothing here
 
   # ! ----- STOP EDITING ----- ! #
   return(invisible(sim))
