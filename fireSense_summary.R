@@ -125,7 +125,18 @@ InitMulti <- function(sim) {
   # # ! ----- EDIT BELOW ----- ! #
 
   ## check for necessary output files -----------------------------------------------
-  allReps <- sprintf("rep%02d", P(sim)$reps)
+  mod$useOutputs <- NROW(sim$outputsDF) > 0
+  if (mod$useOutputs) {
+    reps_str <- sub(".*/rep(\\d+)/.*", "\\1", sim$outputsDF$file)
+    mod$allReps <- paste0("rep", sort(unique(reps_str[as.integer(reps_str) %in% Par$reps])))
+    
+  } else {
+    mod$allReps <- sprintf("rep%02d", P(sim)$reps)
+  }
+  if (all(is.na(P(sim)$simTimes))) {
+    P(sim)$simTimes <- unlist(times(sim)[c("start", "end")])
+  }
+  
   padL <- ceiling(log10(P(sim)$years[2] + 1))
   padYearStart <- paddedFloatToChar(P(sim)$years[1], padL = padL)
   padYearEnd <- paddedFloatToChar(P(sim)$years[2], padL = padL)
@@ -143,7 +154,7 @@ InitMulti <- function(sim) {
 
   filesUserHas <- c(bmbs)
 
-  dirsExpected <- file.path(P(sim)$simOutputPath, allReps)
+  dirsExpected <- file.path(P(sim)$simOutputPath, mod$allReps)
   filesExpected <- as.character(sapply(dirsExpected, function(d) {
     c(
       file.path(d, sprintf("burnMap_year%04d.tif", P(sim)$years[2])),
